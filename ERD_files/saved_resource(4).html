@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+
+<title>Portfolio Management ERD — Wells Fargo</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.0/mermaid.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #ffffff;
+    font-family: 'Segoe UI', -apple-system, sans-serif;
+    padding: 40px;
+    min-height: 100vh;
+  }
+  .header {
+    margin-bottom: 32px;
+    border-bottom: 2px solid #CC0000;
+    padding-bottom: 16px;
+  }
+  .header h1 {
+    font-size: 20px;
+    font-weight: 700;
+    color: #CC0000;
+    letter-spacing: -0.3px;
+  }
+  .header p {
+    font-size: 13px;
+    color: #555;
+    margin-top: 4px;
+  }
+  #erd {
+    background: #fafafa;
+    border: 1px solid #e8e8e8;
+    border-radius: 10px;
+    padding: 32px 24px;
+  }
+  .legend {
+    margin-top: 28px;
+    display: flex;
+    gap: 32px;
+    font-size: 12px;
+    color: #666;
+    border-top: 1px solid #eee;
+    padding-top: 16px;
+  }
+  .legend span { font-weight: 600; color: #333; margin-right: 4px; }
+  .footer {
+    margin-top: 20px;
+    font-size: 11px;
+    color: #999;
+    text-align: right;
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html" data-new-gr-c-s-check-loaded="14.1277.0" data-gr-ext-installed="">
+
+<div class="header">
+  <h1>Portfolio Management System — Entity Relationship Diagram</h1>
+  <p>Wells Fargo Software Engineering Virtual Experience &nbsp;·&nbsp; Jaswanthi Golla &nbsp;·&nbsp; github.com/jaswanthigolla-source</p>
+</div>
+
+<div id="erd">
+  <div class="mermaid" data-processed="true"><svg aria-roledescription="er" role="graphics-document document" viewBox="-10 -10 221.51856994628906 1094" style="max-width: 221.51856994628906px;" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg" width="100%" id="mermaid-1776965779324"><style>#mermaid-1776965779324{font-family:"trebuchet ms",verdana,arial,sans-serif;font-size:14px;fill:#333;}#mermaid-1776965779324 .error-icon{fill:#552222;}#mermaid-1776965779324 .error-text{fill:#552222;stroke:#552222;}#mermaid-1776965779324 .edge-thickness-normal{stroke-width:2px;}#mermaid-1776965779324 .edge-thickness-thick{stroke-width:3.5px;}#mermaid-1776965779324 .edge-pattern-solid{stroke-dasharray:0;}#mermaid-1776965779324 .edge-pattern-dashed{stroke-dasharray:3;}#mermaid-1776965779324 .edge-pattern-dotted{stroke-dasharray:2;}#mermaid-1776965779324 .marker{fill:#666666;stroke:#666666;}#mermaid-1776965779324 .marker.cross{stroke:#666666;}#mermaid-1776965779324 svg{font-family:"trebuchet ms",verdana,arial,sans-serif;font-size:14px;}#mermaid-1776965779324 .entityBox{fill:#ECECFF;stroke:#9370DB;}#mermaid-1776965779324 .attributeBoxOdd{fill:#ffffff;stroke:#9370DB;}#mermaid-1776965779324 .attributeBoxEven{fill:#f2f2f2;stroke:#9370DB;}#mermaid-1776965779324 .relationshipLabelBox{fill:hsl(80, 100%, 96.2745098039%);opacity:0.7;background-color:hsl(80, 100%, 96.2745098039%);}#mermaid-1776965779324 .relationshipLabelBox rect{opacity:0.5;}#mermaid-1776965779324 .relationshipLine{stroke:#666666;}#mermaid-1776965779324 .entityTitleText{text-anchor:middle;font-size:18px;fill:#333;}#mermaid-1776965779324 #MD_PARENT_START{fill:#f5f5f5!important;stroke:#666666!important;stroke-width:1;}#mermaid-1776965779324 #MD_PARENT_END{fill:#f5f5f5!important;stroke:#666666!important;stroke-width:1;}#mermaid-1776965779324 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g></g><defs><marker orient="auto" markerHeight="240" markerWidth="190" refY="7" refX="0" id="MD_PARENT_START"><path d="M 18,7 L9,13 L1,7 L9,1 Z"></path></marker></defs><defs><marker orient="auto" markerHeight="28" markerWidth="20" refY="7" refX="19" id="MD_PARENT_END"><path d="M 18,7 L9,13 L1,7 L9,1 Z"></path></marker></defs><defs><marker orient="auto" markerHeight="18" markerWidth="18" refY="9" refX="0" id="ONLY_ONE_START"><path d="M9,0 L9,18 M15,0 L15,18" fill="none" stroke="gray"></path></marker></defs><defs><marker orient="auto" markerHeight="18" markerWidth="18" refY="9" refX="18" id="ONLY_ONE_END"><path d="M3,0 L3,18 M9,0 L9,18" fill="none" stroke="gray"></path></marker></defs><defs><marker orient="auto" markerHeight="18" markerWidth="30" refY="9" refX="0" id="ZERO_OR_ONE_START"><circle r="6" cy="9" cx="21" fill="white" stroke="gray"></circle><path d="M9,0 L9,18" fill="none" stroke="gray"></path></marker></defs><defs><marker orient="auto" markerHeight="18" markerWidth="30" refY="9" refX="30" id="ZERO_OR_ONE_END"><circle r="6" cy="9" cx="9" fill="white" stroke="gray"></circle><path d="M21,0 L21,18" fill="none" stroke="gray"></path></marker></defs><defs><marker orient="auto" markerHeight="36" markerWidth="45" refY="18" refX="18" id="ONE_OR_MORE_START"><path d="M0,18 Q 18,0 36,18 Q 18,36 0,18 M42,9 L42,27" fill="none" stroke="gray"></path></marker></defs><defs><marker orient="auto" markerHeight="36" markerWidth="45" refY="18" refX="27" id="ONE_OR_MORE_END"><path d="M3,9 L3,27 M9,18 Q27,0 45,18 Q27,36 9,18" fill="none" stroke="gray"></path></marker></defs><defs><marker orient="auto" markerHeight="36" markerWidth="57" refY="18" refX="18" id="ZERO_OR_MORE_START"><circle r="6" cy="18" cx="48" fill="white" stroke="gray"></circle><path d="M0,18 Q18,0 36,18 Q18,36 0,18" fill="none" stroke="gray"></path></marker></defs><defs><marker orient="auto" markerHeight="36" markerWidth="57" refY="18" refX="39" id="ZERO_OR_MORE_END"><circle r="6" cy="18" cx="9" fill="white" stroke="gray"></circle><path d="M21,18 Q39,0 57,18 Q39,36 21,18" fill="none" stroke="gray"></path></marker></defs><path style="stroke: gray; fill: none;" marker-start="url(#ONLY_ONE_START)" marker-end="url(#ZERO_OR_MORE_END)" d="M100.759,198L100.759,206.333C100.759,214.667,100.759,231.333,100.759,248C100.759,264.667,100.759,281.333,100.759,289.667L100.759,298" class="er relationshipLine"></path><path style="stroke: gray; fill: none;" marker-start="url(#ONLY_ONE_START)" marker-end="url(#ONLY_ONE_END)" d="M100.759,498L100.759,506.333C100.759,514.667,100.759,531.333,100.759,548C100.759,564.667,100.759,581.333,100.759,589.667L100.759,598" class="er relationshipLine"></path><path style="stroke: gray; fill: none;" marker-start="url(#ONLY_ONE_START)" marker-end="url(#ZERO_OR_MORE_END)" d="M100.759,732L100.759,740.333C100.759,748.667,100.759,765.333,100.759,782C100.759,798.667,100.759,815.333,100.759,823.667L100.759,832" class="er relationshipLine"></path><g transform="translate(28.27698516845703,20 )" id="entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487"><rect height="178" width="144.964599609375" y="0" x="0" class="er entityBox"></rect><text style="dominant-baseline: middle; text-anchor: middle; font-size: 12px;" transform="translate(72.4822998046875,12)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487" class="er entityLabel">FINANCIAL_ADVISOR</text><rect height="22" width="58.98138427734375" y="24" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,35)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-1-type" class="er entityLabel">bigint</text><rect height="22" width="63.2955322265625" y="24" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,35)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-1-name" class="er entityLabel">id</text><rect height="22" width="22.68768310546875" y="24" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,35)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-1-key" class="er entityLabel">PK</text><rect height="22" width="58.98138427734375" y="46" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,57)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-2-type" class="er entityLabel">varchar</text><rect height="22" width="63.2955322265625" y="46" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,57)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-2-name" class="er entityLabel">first_name</text><rect height="22" width="22.68768310546875" y="46" x="122.27691650390625" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,57)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-2-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="68" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,79)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-3-type" class="er entityLabel">varchar</text><rect height="22" width="63.2955322265625" y="68" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,79)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-3-name" class="er entityLabel">last_name</text><rect height="22" width="22.68768310546875" y="68" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,79)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-3-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="90" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,101)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-4-type" class="er entityLabel">varchar</text><rect height="22" width="63.2955322265625" y="90" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,101)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-4-name" class="er entityLabel">email</text><rect height="22" width="22.68768310546875" y="90" x="122.27691650390625" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,101)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-4-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="112" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,123)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-5-type" class="er entityLabel">varchar</text><rect height="22" width="63.2955322265625" y="112" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,123)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-5-name" class="er entityLabel">phone</text><rect height="22" width="22.68768310546875" y="112" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,123)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-5-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="134" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,145)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-6-type" class="er entityLabel">timestamp</text><rect height="22" width="63.2955322265625" y="134" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,145)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-6-name" class="er entityLabel">created_at</text><rect height="22" width="22.68768310546875" y="134" x="122.27691650390625" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,145)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-6-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="156" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,167)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-7-type" class="er entityLabel">timestamp</text><rect height="22" width="63.2955322265625" y="156" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,167)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-7-name" class="er entityLabel">updated_at</text><rect height="22" width="22.68768310546875" y="156" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,167)" y="0" x="0" id="text-entity-FINANCIALADVISOR-b0599b4c-ee9f-52bb-ad3f-12ed693c0487-attr-7-key" class="er entityLabel"></text></g><g transform="translate(28.27698516845703,298 )" id="entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e"><rect height="200" width="144.964599609375" y="0" x="0" class="er entityBox"></rect><text style="dominant-baseline: middle; text-anchor: middle; font-size: 12px;" transform="translate(72.4822998046875,12)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e" class="er entityLabel">CLIENT</text><rect height="22" width="58.98138427734375" y="24" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,35)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-1-type" class="er entityLabel">bigint</text><rect height="22" width="63.2955322265625" y="24" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,35)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-1-name" class="er entityLabel">id</text><rect height="22" width="22.68768310546875" y="24" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,35)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-1-key" class="er entityLabel">PK</text><rect height="22" width="58.98138427734375" y="46" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,57)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-2-type" class="er entityLabel">bigint</text><rect height="22" width="63.2955322265625" y="46" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,57)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-2-name" class="er entityLabel">advisor_id</text><rect height="22" width="22.68768310546875" y="46" x="122.27691650390625" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,57)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-2-key" class="er entityLabel">FK</text><rect height="22" width="58.98138427734375" y="68" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,79)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-3-type" class="er entityLabel">varchar</text><rect height="22" width="63.2955322265625" y="68" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,79)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-3-name" class="er entityLabel">first_name</text><rect height="22" width="22.68768310546875" y="68" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,79)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-3-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="90" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,101)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-4-type" class="er entityLabel">varchar</text><rect height="22" width="63.2955322265625" y="90" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,101)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-4-name" class="er entityLabel">last_name</text><rect height="22" width="22.68768310546875" y="90" x="122.27691650390625" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,101)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-4-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="112" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,123)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-5-type" class="er entityLabel">varchar</text><rect height="22" width="63.2955322265625" y="112" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,123)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-5-name" class="er entityLabel">email</text><rect height="22" width="22.68768310546875" y="112" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,123)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-5-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="134" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,145)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-6-type" class="er entityLabel">varchar</text><rect height="22" width="63.2955322265625" y="134" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,145)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-6-name" class="er entityLabel">phone</text><rect height="22" width="22.68768310546875" y="134" x="122.27691650390625" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,145)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-6-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="156" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,167)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-7-type" class="er entityLabel">timestamp</text><rect height="22" width="63.2955322265625" y="156" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,167)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-7-name" class="er entityLabel">created_at</text><rect height="22" width="22.68768310546875" y="156" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,167)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-7-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="178" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,189)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-8-type" class="er entityLabel">timestamp</text><rect height="22" width="63.2955322265625" y="178" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,189)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-8-name" class="er entityLabel">updated_at</text><rect height="22" width="22.68768310546875" y="178" x="122.27691650390625" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,189)" y="0" x="0" id="text-entity-CLIENT-4e758595-4f1b-56da-a7d5-19191cf4cb1e-attr-8-key" class="er entityLabel"></text></g><g transform="translate(28.27698516845703,598 )" id="entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b"><rect height="134" width="144.964599609375" y="0" x="0" class="er entityBox"></rect><text style="dominant-baseline: middle; text-anchor: middle; font-size: 12px;" transform="translate(72.4822998046875,12)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b" class="er entityLabel">PORTFOLIO</text><rect height="22" width="58.98138427734375" y="24" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,35)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-1-type" class="er entityLabel">bigint</text><rect height="22" width="63.2955322265625" y="24" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,35)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-1-name" class="er entityLabel">id</text><rect height="22" width="22.68768310546875" y="24" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,35)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-1-key" class="er entityLabel">PK</text><rect height="22" width="58.98138427734375" y="46" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,57)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-2-type" class="er entityLabel">bigint</text><rect height="22" width="63.2955322265625" y="46" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,57)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-2-name" class="er entityLabel">client_id</text><rect height="22" width="22.68768310546875" y="46" x="122.27691650390625" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,57)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-2-key" class="er entityLabel">FK</text><rect height="22" width="58.98138427734375" y="68" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,79)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-3-type" class="er entityLabel">varchar</text><rect height="22" width="63.2955322265625" y="68" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,79)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-3-name" class="er entityLabel">name</text><rect height="22" width="22.68768310546875" y="68" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,79)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-3-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="90" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,101)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-4-type" class="er entityLabel">timestamp</text><rect height="22" width="63.2955322265625" y="90" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,101)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-4-name" class="er entityLabel">created_at</text><rect height="22" width="22.68768310546875" y="90" x="122.27691650390625" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,101)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-4-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="112" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,123)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-5-type" class="er entityLabel">timestamp</text><rect height="22" width="63.2955322265625" y="112" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,123)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-5-name" class="er entityLabel">updated_at</text><rect height="22" width="22.68768310546875" y="112" x="122.27691650390625" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(127.27691650390625,123)" y="0" x="0" id="text-entity-PORTFOLIO-9b21d1d1-53a7-5598-9afe-65b1907d710b-attr-5-key" class="er entityLabel"></text></g><g transform="translate(20,832 )" id="entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3"><rect height="222" width="161.51856994628906" y="0" x="0" class="er entityBox"></rect><text style="dominant-baseline: middle; text-anchor: middle; font-size: 12px;" transform="translate(80.75928497314453,12)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3" class="er entityLabel">SECURITY</text><rect height="22" width="58.98138427734375" y="24" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,35)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-1-type" class="er entityLabel">bigint</text><rect height="22" width="79.84950256347656" y="24" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,35)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-1-name" class="er entityLabel">id</text><rect height="22" width="22.68768310546875" y="24" x="138.8308868408203" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(143.8308868408203,35)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-1-key" class="er entityLabel">PK</text><rect height="22" width="58.98138427734375" y="46" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,57)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-2-type" class="er entityLabel">bigint</text><rect height="22" width="79.84950256347656" y="46" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,57)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-2-name" class="er entityLabel">portfolio_id</text><rect height="22" width="22.68768310546875" y="46" x="138.8308868408203" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(143.8308868408203,57)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-2-key" class="er entityLabel">FK</text><rect height="22" width="58.98138427734375" y="68" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,79)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-3-type" class="er entityLabel">varchar</text><rect height="22" width="79.84950256347656" y="68" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,79)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-3-name" class="er entityLabel">name</text><rect height="22" width="22.68768310546875" y="68" x="138.8308868408203" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(143.8308868408203,79)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-3-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="90" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,101)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-4-type" class="er entityLabel">varchar</text><rect height="22" width="79.84950256347656" y="90" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,101)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-4-name" class="er entityLabel">category</text><rect height="22" width="22.68768310546875" y="90" x="138.8308868408203" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(143.8308868408203,101)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-4-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="112" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,123)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-5-type" class="er entityLabel">date</text><rect height="22" width="79.84950256347656" y="112" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,123)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-5-name" class="er entityLabel">purchase_date</text><rect height="22" width="22.68768310546875" y="112" x="138.8308868408203" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(143.8308868408203,123)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-5-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="134" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,145)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-6-type" class="er entityLabel">decimal</text><rect height="22" width="79.84950256347656" y="134" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,145)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-6-name" class="er entityLabel">purchase_price</text><rect height="22" width="22.68768310546875" y="134" x="138.8308868408203" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(143.8308868408203,145)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-6-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="156" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,167)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-7-type" class="er entityLabel">int</text><rect height="22" width="79.84950256347656" y="156" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,167)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-7-name" class="er entityLabel">quantity</text><rect height="22" width="22.68768310546875" y="156" x="138.8308868408203" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(143.8308868408203,167)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-7-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="178" x="0" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,189)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-8-type" class="er entityLabel">timestamp</text><rect height="22" width="79.84950256347656" y="178" x="58.98138427734375" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,189)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-8-name" class="er entityLabel">created_at</text><rect height="22" width="22.68768310546875" y="178" x="138.8308868408203" class="er attributeBoxEven"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(143.8308868408203,189)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-8-key" class="er entityLabel"></text><rect height="22" width="58.98138427734375" y="200" x="0" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(5,211)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-9-type" class="er entityLabel">timestamp</text><rect height="22" width="79.84950256347656" y="200" x="58.98138427734375" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(63.98138427734375,211)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-9-name" class="er entityLabel">updated_at</text><rect height="22" width="22.68768310546875" y="200" x="138.8308868408203" class="er attributeBoxOdd"></rect><text style="dominant-baseline: middle; font-size: 10.2px;" transform="translate(143.8308868408203,211)" y="0" x="0" id="text-entity-SECURITY-cc682b58-7c00-504a-acc3-0fb5c9435be3-attr-9-key" class="er entityLabel"></text></g><rect height="14" width="46.6953125" y="241" x="77.41134643554688" class="er relationshipLabelBox"></rect><text style="text-anchor: middle; dominant-baseline: middle; font-size: 12px;" y="248" x="100.75900268554688" id="rel1" class="er relationshipLabel">manages</text><rect height="14" width="26.92578125" y="541" x="87.29611206054688" class="er relationshipLabelBox"></rect><text style="text-anchor: middle; dominant-baseline: middle; font-size: 12px;" y="548" x="100.75900268554688" id="rel2" class="er relationshipLabel">owns</text><rect height="14" width="44.978515625" y="775" x="78.26974487304688" class="er relationshipLabelBox"></rect><text style="text-anchor: middle; dominant-baseline: middle; font-size: 12px;" y="782" x="100.75900268554688" id="rel3" class="er relationshipLabel">contains</text></svg></div>
+</div>
+
+<div class="legend">
+  <div><span>||--||</span> One-to-one (Client → Portfolio)</div>
+  <div><span>||--o{</span> One-to-many (Advisor → Clients, Portfolio → Securities)</div>
+  <div><span>PK</span> Primary key &nbsp;&nbsp;<span>FK</span> Foreign key</div>
+</div>
+
+<div class="footer">
+  Java 17 · Spring Boot · PostgreSQL · React · Kubernetes &nbsp;|&nbsp; Designed for relational DB — normalized, indexed, scalable
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'default',
+    er: {
+      diagramPadding: 30,
+      layoutDirection: 'TB',
+      minEntityWidth: 100,
+      minEntityHeight: 75,
+      entityPadding: 15,
+      useMaxWidth: true
+    },
+    themeVariables: {
+      primaryColor: '#fff5f5',
+      primaryBorderColor: '#CC0000',
+      primaryTextColor: '#1a1a1a',
+      lineColor: '#666666',
+      fontSize: '14px'
+    }
+  });
+</script>
+
+
+</body><grammarly-desktop-integration data-grammarly-shadow-root="true"><template shadowrootmode="open"><style>
+      div.grammarly-desktop-integration {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+        -moz-user-select: none;
+        -webkit-user-select: none;
+        -ms-user-select:none;
+        user-select:none;
+      }
+
+      div.grammarly-desktop-integration:before {
+        content: attr(data-content);
+      }
+    </style><div aria-label="grammarly-integration" role="group" tabindex="-1" class="grammarly-desktop-integration" data-content="{&quot;mode&quot;:&quot;full&quot;,&quot;isActive&quot;:true,&quot;isUserDisabled&quot;:false}"></div></template></grammarly-desktop-integration></html>
