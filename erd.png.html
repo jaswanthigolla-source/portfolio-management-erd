@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Portfolio Management ERD — Wells Fargo</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.0/mermaid.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #ffffff;
+    font-family: 'Segoe UI', -apple-system, sans-serif;
+    padding: 40px;
+    min-height: 100vh;
+  }
+  .header {
+    margin-bottom: 32px;
+    border-bottom: 2px solid #CC0000;
+    padding-bottom: 16px;
+  }
+  .header h1 {
+    font-size: 20px;
+    font-weight: 700;
+    color: #CC0000;
+    letter-spacing: -0.3px;
+  }
+  .header p {
+    font-size: 13px;
+    color: #555;
+    margin-top: 4px;
+  }
+  #erd {
+    background: #fafafa;
+    border: 1px solid #e8e8e8;
+    border-radius: 10px;
+    padding: 32px 24px;
+  }
+  .legend {
+    margin-top: 28px;
+    display: flex;
+    gap: 32px;
+    font-size: 12px;
+    color: #666;
+    border-top: 1px solid #eee;
+    padding-top: 16px;
+  }
+  .legend span { font-weight: 600; color: #333; margin-right: 4px; }
+  .footer {
+    margin-top: 20px;
+    font-size: 11px;
+    color: #999;
+    text-align: right;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Portfolio Management System — Entity Relationship Diagram</h1>
+  <p>Wells Fargo Software Engineering Virtual Experience &nbsp;·&nbsp; Jaswanthi Golla &nbsp;·&nbsp; github.com/jaswanthigolla-source</p>
+</div>
+
+<div id="erd">
+  <div class="mermaid">
+erDiagram
+  FINANCIAL_ADVISOR {
+    bigint id PK
+    varchar first_name
+    varchar last_name
+    varchar email
+    varchar phone
+    timestamp created_at
+    timestamp updated_at
+  }
+  CLIENT {
+    bigint id PK
+    bigint advisor_id FK
+    varchar first_name
+    varchar last_name
+    varchar email
+    varchar phone
+    timestamp created_at
+    timestamp updated_at
+  }
+  PORTFOLIO {
+    bigint id PK
+    bigint client_id FK
+    varchar name
+    timestamp created_at
+    timestamp updated_at
+  }
+  SECURITY {
+    bigint id PK
+    bigint portfolio_id FK
+    varchar name
+    varchar category
+    date purchase_date
+    decimal purchase_price
+    int quantity
+    timestamp created_at
+    timestamp updated_at
+  }
+
+  FINANCIAL_ADVISOR ||--o{ CLIENT : "manages"
+  CLIENT ||--|| PORTFOLIO : "owns"
+  PORTFOLIO ||--o{ SECURITY : "contains"
+  </div>
+</div>
+
+<div class="legend">
+  <div><span>||--||</span> One-to-one (Client → Portfolio)</div>
+  <div><span>||--o{</span> One-to-many (Advisor → Clients, Portfolio → Securities)</div>
+  <div><span>PK</span> Primary key &nbsp;&nbsp;<span>FK</span> Foreign key</div>
+</div>
+
+<div class="footer">
+  Java 17 · Spring Boot · PostgreSQL · React · Kubernetes &nbsp;|&nbsp; Designed for relational DB — normalized, indexed, scalable
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'default',
+    er: {
+      diagramPadding: 30,
+      layoutDirection: 'TB',
+      minEntityWidth: 100,
+      minEntityHeight: 75,
+      entityPadding: 15,
+      useMaxWidth: true
+    },
+    themeVariables: {
+      primaryColor: '#fff5f5',
+      primaryBorderColor: '#CC0000',
+      primaryTextColor: '#1a1a1a',
+      lineColor: '#666666',
+      fontSize: '14px'
+    }
+  });
+</script>
+</body>
+</html>
