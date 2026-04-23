@@ -13,7 +13,7 @@ Relational data model for a multi-advisor portfolio management system. Financial
 
 ## ERD
 
-![Portfolio Management ERD](erd.png)
+![Portfolio Management ERD](C:\Users\Jaswanthi_Golla\Desktop\app\portfolio-management-erd\ERD.jpeg)
 
 ---
 
